@@ -612,6 +612,7 @@ async def get_email_hint(username: str, db: AsyncSession = Depends(get_db)):
 async def forgot_password(
     data: ForgotPasswordRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Request a password reset link for a global Identity."""
@@ -643,9 +644,11 @@ async def forgot_password(
             send_password_reset_email,
         )
 
-        raw_token, expires_at = await create_password_reset_token(identity.id)
+        raw_token, expires_at = await create_password_reset_token(identity.id, db=db)
+        await db.commit()
 
-        reset_url = await build_password_reset_url(db, raw_token)
+        request_base_url = _get_user_facing_base_url(request)
+        reset_url = await build_password_reset_url(db, raw_token, base_url=request_base_url)
         expiry_minutes = int((expires_at - datetime.now(timezone.utc)).total_seconds() // 60)
         background_tasks.add_task(
             send_password_reset_email,
@@ -660,12 +663,70 @@ async def forgot_password(
     return generic_response
 
 
+def _get_user_facing_base_url(request: Request) -> str | None:
+    """Resolve the browser-facing origin for links sent from auth flows."""
+    from urllib.parse import urlsplit
+
+    origin = request.headers.get("origin")
+    if origin:
+        parsed = urlsplit(origin.rstrip("/"))
+        if parsed.scheme and parsed.netloc:
+            return _replace_loopback_host_with_lan(parsed.scheme, parsed.netloc)
+
+    referer = request.headers.get("referer")
+    if referer:
+        parsed = urlsplit(referer)
+        if parsed.scheme and parsed.netloc:
+            return _replace_loopback_host_with_lan(parsed.scheme, parsed.netloc)
+
+    return None
+
+
+def _replace_loopback_host_with_lan(scheme: str, netloc: str) -> str:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(f"{scheme}://{netloc}")
+    host = parsed.hostname
+    if host not in {"localhost", "127.0.0.1", "::1"}:
+        return f"{scheme}://{netloc}"
+
+    lan_ip = _get_lan_ip_address()
+    if not lan_ip:
+        return f"{scheme}://{netloc}"
+
+    suffix = f":{parsed.port}" if parsed.port else ""
+    return f"{scheme}://{lan_ip}{suffix}"
+
+
+def _get_lan_ip_address() -> str | None:
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        for candidate in socket.gethostbyname_ex(hostname)[2]:
+            if candidate and not candidate.startswith("127."):
+                return candidate
+    except OSError:
+        pass
+
+    return None
+
+
 @router.post("/reset-password")
 async def reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
     """Reset a password using a valid single-use token."""
     from app.services.password_reset_service import consume_password_reset_token
 
-    token_data = await consume_password_reset_token(data.token)
+    token_data = await consume_password_reset_token(data.token, db=db)
     if not token_data:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 

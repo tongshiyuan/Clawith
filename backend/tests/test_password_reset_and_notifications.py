@@ -145,6 +145,15 @@ async def test_build_password_reset_url_uses_env_public_base_url(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_build_password_reset_url_uses_explicit_browser_base_url():
+    db = RecordingDB()
+
+    url = await password_reset_service.build_password_reset_url(db, "abc123", base_url="http://localhost:3008/")
+
+    assert url == "http://localhost:3008/reset-password?token=abc123"
+
+
+@pytest.mark.asyncio
 async def test_consume_password_reset_token_works_correctly(monkeypatch):
     user_id = uuid.uuid4()
     raw_token = "raw-token"
@@ -162,10 +171,94 @@ async def test_consume_password_reset_token_works_correctly(monkeypatch):
     result = await password_reset_service.consume_password_reset_token(raw_token)
 
     assert result is not None
-    assert result["user_id"] == user_id
+    assert result["identity_id"] == user_id
     # Should be deleted after consumption
     assert f"pwd_reset:token:{token_hash}" in mock_redis.deleted
     assert f"pwd_reset:user:{user_id}" in mock_redis.deleted
+
+
+@pytest.mark.asyncio
+async def test_password_reset_token_falls_back_to_db_when_redis_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        password_reset_service,
+        "get_settings",
+        lambda: SimpleNamespace(PASSWORD_RESET_TOKEN_EXPIRE_MINUTES=15, PUBLIC_BASE_URL=""),
+    )
+
+    async def unavailable_redis():
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(password_reset_service, "get_redis", unavailable_redis)
+
+    stored_setting = None
+
+    class FallbackDB(RecordingDB):
+        async def execute(self, _statement):
+            return DummyResult(stored_setting)
+
+        def add(self, obj):
+            nonlocal stored_setting
+            stored_setting = obj
+            super().add(obj)
+
+    db = FallbackDB()
+    identity_id = uuid.uuid4()
+
+    raw_token, expires_at = await password_reset_service.create_password_reset_token(identity_id, db=db)
+
+    assert len(raw_token) >= 20
+    assert expires_at > datetime.now(timezone.utc)
+    assert stored_setting is not None
+
+    result = await password_reset_service.consume_password_reset_token(raw_token, db=db)
+
+    assert result == {"identity_id": identity_id}
+    assert stored_setting.value["tokens"] == {}
+    assert stored_setting.value["users"] == {}
+
+
+@pytest.mark.asyncio
+async def test_password_reset_token_checks_db_fallback_on_redis_miss(monkeypatch):
+    monkeypatch.setattr(
+        password_reset_service,
+        "get_settings",
+        lambda: SimpleNamespace(PASSWORD_RESET_TOKEN_EXPIRE_MINUTES=15, PUBLIC_BASE_URL=""),
+    )
+
+    class EmptyRedis(MockRedis):
+        pass
+
+    mock_redis = EmptyRedis()
+
+    async def available_redis():
+        return mock_redis
+
+    monkeypatch.setattr(password_reset_service, "get_redis", available_redis)
+
+    stored_setting = None
+
+    class FallbackDB(RecordingDB):
+        async def execute(self, _statement):
+            return DummyResult(stored_setting)
+
+        def add(self, obj):
+            nonlocal stored_setting
+            stored_setting = obj
+            super().add(obj)
+
+    db = FallbackDB()
+    identity_id = uuid.uuid4()
+
+    async def unavailable_redis():
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(password_reset_service, "get_redis", unavailable_redis)
+    raw_token, _ = await password_reset_service.create_password_reset_token(identity_id, db=db)
+
+    monkeypatch.setattr(password_reset_service, "get_redis", available_redis)
+    result = await password_reset_service.consume_password_reset_token(raw_token, db=db)
+
+    assert result == {"identity_id": identity_id}
 
 
 @pytest.mark.asyncio
@@ -176,6 +269,7 @@ async def test_forgot_password_returns_generic_response_for_unknown_email():
     response = await auth_api.forgot_password(
         ForgotPasswordRequest(email="missing@example.com"),
         background_tasks,
+        SimpleNamespace(headers={}),
         db,
     )
 
@@ -205,11 +299,36 @@ async def test_forgot_password_queues_background_email(monkeypatch):
     monkeypatch.setattr(password_reset_service, "build_password_reset_url", fake_build_password_reset_url)
 
 
-    response = await auth_api.forgot_password(ForgotPasswordRequest(email=user.email), background_tasks, db)
+    response = await auth_api.forgot_password(
+        ForgotPasswordRequest(email=user.email),
+        background_tasks,
+        SimpleNamespace(headers={"origin": "http://localhost:3008"}),
+        db,
+    )
 
     assert response["ok"] is True
     assert db.committed is True
     assert len(background_tasks.tasks) == 1
+
+
+def test_get_user_facing_base_url_prefers_origin(monkeypatch):
+    monkeypatch.setattr(auth_api, "_get_lan_ip_address", lambda: "192.168.60.145")
+    request = SimpleNamespace(headers={"origin": "http://localhost:3008", "referer": "https://try.clawith.ai/login"})
+
+    assert auth_api._get_user_facing_base_url(request) == "http://192.168.60.145:3008"
+
+
+def test_get_user_facing_base_url_falls_back_to_referer_origin(monkeypatch):
+    monkeypatch.setattr(auth_api, "_get_lan_ip_address", lambda: "192.168.60.145")
+    request = SimpleNamespace(headers={"referer": "http://localhost:3008/forgot-password"})
+
+    assert auth_api._get_user_facing_base_url(request) == "http://192.168.60.145:3008"
+
+
+def test_get_user_facing_base_url_keeps_public_origin():
+    request = SimpleNamespace(headers={"origin": "https://app.example.com"})
+
+    assert auth_api._get_user_facing_base_url(request) == "https://app.example.com"
 
 
 
